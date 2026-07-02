@@ -125,9 +125,12 @@ func TestListenReconnectingStreamHandlesEventsAndStopsOnEOF(t *testing.T) {
 	assert.True(t, client.closeCalled.Load())
 }
 
-func TestListenReconnectingStreamStopDecisionReturnsNil(t *testing.T) {
+func TestListenReconnectingStreamContextCancellationReturnsNil(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
 	client := &testListenClient{
 		recvFn: func() (testListenEvent, error) {
+			cancel()
 			return testListenEvent{}, status.Error(codes.Canceled, "canceled")
 		},
 	}
@@ -136,10 +139,30 @@ func TestListenReconnectingStreamStopDecisionReturnsNil(t *testing.T) {
 		return client, nil
 	})
 
-	err := listenReconnectingStream(context.Background(), stream, testListenConfig(stream, context.Background(), func(context.Context) bool {
+	err := listenReconnectingStream(ctx, stream, testListenConfig(stream, context.Background(), func(context.Context) bool {
 		return true
 	}))
 	require.NoError(t, err)
+}
+
+func TestListenReconnectingStreamPermanentRecvErrorReturnsError(t *testing.T) {
+	recvErr := status.Error(codes.PermissionDenied, "permission denied")
+	client := &testListenClient{
+		recvFn: func() (testListenEvent, error) {
+			return testListenEvent{}, recvErr
+		},
+	}
+
+	stream := newTestListenStream(t, client, func(ctx context.Context) (*testListenClient, error) {
+		t.Fatal("constructor should not run after permanent receive error")
+		return nil, nil
+	})
+
+	err := listenReconnectingStream(context.Background(), stream, testListenConfig(stream, context.Background(), func(context.Context) bool {
+		return true
+	}))
+	require.ErrorIs(t, err, recvErr)
+	assert.Equal(t, codes.PermissionDenied, status.Code(err))
 }
 
 func TestListenReconnectingStreamReconnectsOnEOFWhenPolicyAllows(t *testing.T) {
@@ -254,13 +277,17 @@ func TestListenReconnectingStreamNoProgressReconnectsBeforeCap(t *testing.T) {
 func TestListenReconnectingStreamNoProgressStopsAtCap(t *testing.T) {
 	disableStreamBackoffForTest(t)
 
+	recvCalls := atomic.Int32{}
+	constructorCalls := atomic.Int32{}
 	client := &testListenClient{
 		recvFn: func() (testListenEvent, error) {
+			recvCalls.Add(1)
 			return testListenEvent{}, fmt.Errorf("plain recv error")
 		},
 	}
 
 	stream := newTestListenStream(t, client, func(ctx context.Context) (*testListenClient, error) {
+		constructorCalls.Add(1)
 		return nil, fmt.Errorf("plain connect error")
 	})
 
@@ -269,6 +296,8 @@ func TestListenReconnectingStreamNoProgressStopsAtCap(t *testing.T) {
 	}))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to resubscribe")
+	assert.Greater(t, recvCalls.Load(), int32(1))
+	assert.Greater(t, constructorCalls.Load(), int32(1))
 }
 
 func TestListenReconnectingStreamNoProgressStopsImmediatelyWhenConfigured(t *testing.T) {

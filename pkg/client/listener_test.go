@@ -203,6 +203,115 @@ func TestWorkflowRunsListenerAddWorkflowRunRollsBackHandlerWhenSendFails(t *test
 	})
 	require.Error(t, err)
 	assert.False(t, listener.hasHandlers())
+
+	require.NoError(t, listener.Close())
+	require.Eventually(t, func() bool {
+		return !listener.isListening()
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestWorkflowRunsListenerAddWorkflowRunKeepsHandlerDuringRecovery(t *testing.T) {
+	disableStreamBackoffForTest(t)
+
+	logger := zerolog.Nop()
+	oldClient := &mockSubscribeClient{}
+	recoveredClient := &mockSubscribeClient{
+		recvChan: make(chan *dispatchercontracts.WorkflowRunEvent),
+	}
+
+	var listener *WorkflowRunsListener
+	reconnectFailures := atomic.Int32{}
+	recoveredSends := atomic.Int32{}
+	missingHandlerDuringRecovery := atomic.Bool{}
+
+	oldClient.sendFn = func(req *dispatchercontracts.SubscribeToWorkflowRunsRequest) error {
+		listener.stopListening()
+		return status.Error(codes.Unavailable, "stream broken")
+	}
+	recoveredClient.sendFn = func(req *dispatchercontracts.SubscribeToWorkflowRunsRequest) error {
+		recoveredSends.Add(1)
+		if !listener.hasHandlers() {
+			missingHandlerDuringRecovery.Store(true)
+		}
+		return nil
+	}
+
+	listener = &WorkflowRunsListener{
+		constructor: func(ctx context.Context) (dispatchercontracts.Dispatcher_SubscribeToWorkflowRunsClient, error) {
+			if reconnectFailures.Add(1) <= int32(retry.StreamSyncMaxAttempts*retry.StreamSyncMaxAttempts) {
+				return nil, status.Error(codes.Unavailable, "engine down")
+			}
+
+			return recoveredClient, nil
+		},
+		client: oldClient,
+		l:      &logger,
+	}
+	require.True(t, listener.startListening())
+
+	err := listener.AddWorkflowRun("run-1", "session-1", func(event WorkflowRunEvent) error {
+		return nil
+	})
+	require.NoError(t, err)
+	assert.False(t, missingHandlerDuringRecovery.Load())
+	assert.True(t, listener.hasHandlers())
+	assert.GreaterOrEqual(t, recoveredSends.Load(), int32(1))
+
+	require.NoError(t, listener.Close())
+	close(recoveredClient.recvChan)
+	require.Eventually(t, func() bool {
+		return !listener.isListening()
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestWorkflowRunsListenerStoreSkipsTombstonedBucket(t *testing.T) {
+	listener := &WorkflowRunsListener{}
+	workflowRunID := "run-1"
+	sessionID := "session-1"
+
+	stale := &threadSafeHandlers{
+		handlers: map[string]WorkflowRunEventHandler{},
+		deleted:  true,
+	}
+	listener.handlers.Store(workflowRunID, stale)
+
+	calls := atomic.Int32{}
+	rollback := listener.storeWorkflowRunHandler(workflowRunID, sessionID, func(event WorkflowRunEvent) error {
+		calls.Add(1)
+		return nil
+	})
+	defer rollback()
+
+	handlers, ok := listener.handlers.Load(workflowRunID)
+	require.True(t, ok)
+	assert.NotSame(t, stale, handlers.(*threadSafeHandlers))
+
+	require.NoError(t, listener.handleWorkflowRun(&dispatchercontracts.WorkflowRunEvent{
+		WorkflowRunId: workflowRunID,
+	}))
+	assert.Equal(t, int32(1), calls.Load())
+}
+
+func TestWorkflowRunsListenerTombstonedBucketIsIgnored(t *testing.T) {
+	listener := &WorkflowRunsListener{}
+	workflowRunID := "run-1"
+
+	calls := atomic.Int32{}
+	listener.handlers.Store(workflowRunID, &threadSafeHandlers{
+		handlers: map[string]WorkflowRunEventHandler{
+			"session-1": func(event WorkflowRunEvent) error {
+				calls.Add(1)
+				return nil
+			},
+		},
+		deleted: true,
+	})
+
+	assert.False(t, listener.hasHandlers())
+	require.NoError(t, listener.handleWorkflowRun(&dispatchercontracts.WorkflowRunEvent{
+		WorkflowRunId: workflowRunID,
+	}))
+	assert.Equal(t, int32(0), calls.Load())
 }
 
 func TestGetWorkflowRunsListenerImmediateAddDoesNotOpenSecondStream(t *testing.T) {

@@ -147,6 +147,170 @@ func TestDurableEventsListenerAddSignalRollsBackHandlerWhenSendFails(t *testing.
 	})
 	require.Error(t, err)
 	assert.False(t, listener.hasHandlers())
+
+	require.NoError(t, listener.Close())
+	require.Eventually(t, func() bool {
+		return !listener.isListening()
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestDurableEventsListenerAddSignalKeepsHandlerDuringRecovery(t *testing.T) {
+	disableStreamBackoffForTest(t)
+
+	logger := zerolog.Nop()
+	oldClient := &mockDurableEventClient{}
+	recoveredClient := &mockDurableEventClient{
+		recvCh: make(chan *contracts.DurableEvent),
+	}
+
+	var listener *DurableEventsListener
+	reconnectFailures := atomic.Int32{}
+	recoveredSends := atomic.Int32{}
+	missingHandlerDuringRecovery := atomic.Bool{}
+
+	oldClient.sendFn = func(req *contracts.ListenForDurableEventRequest) error {
+		listener.stopListening()
+		return status.Error(codes.Unavailable, "stream broken")
+	}
+	recoveredClient.sendFn = func(req *contracts.ListenForDurableEventRequest) error {
+		recoveredSends.Add(1)
+		if !listener.hasHandlers() {
+			missingHandlerDuringRecovery.Store(true)
+		}
+		return nil
+	}
+
+	listener = &DurableEventsListener{
+		constructor: func(ctx context.Context) (contracts.V1Dispatcher_ListenForDurableEventClient, error) {
+			if reconnectFailures.Add(1) <= int32(retry.StreamSyncMaxAttempts*retry.StreamSyncMaxAttempts) {
+				return nil, status.Error(codes.Unavailable, "engine down")
+			}
+
+			return recoveredClient, nil
+		},
+		client: oldClient,
+		l:      &logger,
+	}
+	require.True(t, listener.startListening())
+
+	err := listener.AddSignal("task-1", "signal-1", func(e DurableEvent) error {
+		return nil
+	})
+	require.NoError(t, err)
+	assert.False(t, missingHandlerDuringRecovery.Load())
+	assert.True(t, listener.hasHandlers())
+	assert.GreaterOrEqual(t, recoveredSends.Load(), int32(1))
+
+	require.NoError(t, listener.Close())
+	close(recoveredClient.recvCh)
+	require.Eventually(t, func() bool {
+		return !listener.isListening()
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestDurableEventsListenerRollbackHandlersByStableID(t *testing.T) {
+	tuple := listenTuple{taskId: "task-1", signalKey: "signal-1"}
+
+	tests := []struct {
+		name           string
+		rollbackFirst  bool
+		expectedFirst  int32
+		expectedSecond int32
+	}{
+		{
+			name:           "first handler rolls back before second",
+			rollbackFirst:  true,
+			expectedSecond: 1,
+		},
+		{
+			name:          "second handler rolls back before first",
+			expectedFirst: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			listener := &DurableEventsListener{}
+			firstCalls := atomic.Int32{}
+			secondCalls := atomic.Int32{}
+
+			rollbackFirst := listener.storeDurableEventHandler(tuple, func(e DurableEvent) error {
+				firstCalls.Add(1)
+				return nil
+			})
+			rollbackSecond := listener.storeDurableEventHandler(tuple, func(e DurableEvent) error {
+				secondCalls.Add(1)
+				return nil
+			})
+
+			if tt.rollbackFirst {
+				rollbackFirst()
+			} else {
+				rollbackSecond()
+			}
+
+			require.NoError(t, listener.handleEvent(&contracts.DurableEvent{
+				TaskId:    tuple.taskId,
+				SignalKey: tuple.signalKey,
+			}))
+
+			assert.Equal(t, tt.expectedFirst, firstCalls.Load())
+			assert.Equal(t, tt.expectedSecond, secondCalls.Load())
+			assert.False(t, listener.hasHandlers())
+		})
+	}
+}
+
+func TestDurableEventsListenerStoreSkipsTombstonedBucket(t *testing.T) {
+	listener := &DurableEventsListener{}
+	tuple := listenTuple{taskId: "task-1", signalKey: "signal-1"}
+
+	stale := &threadSafeDurableEventHandlers{
+		handlers: map[uint64]DurableEventHandler{},
+		deleted:  true,
+	}
+	listener.handlers.Store(tuple, stale)
+
+	calls := atomic.Int32{}
+	rollback := listener.storeDurableEventHandler(tuple, func(e DurableEvent) error {
+		calls.Add(1)
+		return nil
+	})
+	defer rollback()
+
+	handlers, ok := listener.handlers.Load(tuple)
+	require.True(t, ok)
+	assert.NotSame(t, stale, handlers.(*threadSafeDurableEventHandlers))
+
+	require.NoError(t, listener.handleEvent(&contracts.DurableEvent{
+		TaskId:    tuple.taskId,
+		SignalKey: tuple.signalKey,
+	}))
+	assert.Equal(t, int32(1), calls.Load())
+	assert.False(t, listener.hasHandlers())
+}
+
+func TestDurableEventsListenerTombstonedBucketIsIgnored(t *testing.T) {
+	listener := &DurableEventsListener{}
+	tuple := listenTuple{taskId: "task-1", signalKey: "signal-1"}
+
+	calls := atomic.Int32{}
+	listener.handlers.Store(tuple, &threadSafeDurableEventHandlers{
+		handlers: map[uint64]DurableEventHandler{
+			0: func(e DurableEvent) error {
+				calls.Add(1)
+				return nil
+			},
+		},
+		deleted: true,
+	})
+
+	assert.False(t, listener.hasHandlers())
+	require.NoError(t, listener.handleEvent(&contracts.DurableEvent{
+		TaskId:    tuple.taskId,
+		SignalKey: tuple.signalKey,
+	}))
+	assert.Equal(t, int32(0), calls.Load())
 }
 
 func TestGetDurableEventsListenerImmediateAddDoesNotOpenSecondStream(t *testing.T) {
@@ -482,8 +646,8 @@ func TestDurableEventsListenerReconnectsOnEOFWithRegisteredHandlers(t *testing.T
 
 	received := make(chan DurableEvent, 1)
 	listener.handlers.Store(listenTuple{taskId: "task-1", signalKey: "signal-1"}, &threadSafeDurableEventHandlers{
-		handlers: []DurableEventHandler{
-			func(e DurableEvent) error {
+		handlers: map[uint64]DurableEventHandler{
+			0: func(e DurableEvent) error {
 				received <- e
 				return nil
 			},

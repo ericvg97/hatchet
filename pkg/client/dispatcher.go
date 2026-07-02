@@ -543,10 +543,15 @@ func (a *actionListenerImpl) handleActionResubscribeError(ctx context.Context, e
 		return false
 	}
 
-	if streamDecisionStopsReconnect(retry.ClassifyStreamError(ctx, err)) {
+	decision := retry.ClassifyStreamError(ctx, err)
+	if decision == retry.StreamDecisionStop {
 		a.l.Error().Ctx(ctx).Err(err).Msg("Failed to resubscribe")
 		sendListenerError(ctx, errCh, fmt.Errorf("failed to resubscribe: %w", err))
 		return false
+	}
+
+	if decision == retry.StreamDecisionNoProgress {
+		state.consecutiveNoProgress++
 	}
 
 	if shouldLogReconnectMilestone(state.reconnectAttempt + 1) {
@@ -700,7 +705,6 @@ func (a *actionListenerImpl) retrySubscribe(ctx context.Context) error {
 				Int("reconnect_attempt", attempt).
 				Msg("action listener reconnect attempt continuing")
 		},
-		"failed to resubscribe after %d consecutive no-progress errors: %w",
 	)
 }
 

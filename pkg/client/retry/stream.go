@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -44,22 +45,35 @@ func Sleep(ctx context.Context, d time.Duration) error {
 	return sleepContext(ctx, d)
 }
 
-var streamSleepHook func(ctx context.Context, attempt int) error
+var (
+	streamSleepHookMu sync.RWMutex
+	streamSleepHook   func(ctx context.Context, attempt int) error
+)
 
 // SetStreamSleepHookForTesting overrides stream reconnect sleep for tests.
 func SetStreamSleepHookForTesting(hook func(ctx context.Context, attempt int) error) {
+	streamSleepHookMu.Lock()
+	defer streamSleepHookMu.Unlock()
+
 	streamSleepHook = hook
 }
 
 // ResetStreamSleepHookForTesting clears the stream reconnect sleep test override.
 func ResetStreamSleepHookForTesting() {
+	streamSleepHookMu.Lock()
+	defer streamSleepHookMu.Unlock()
+
 	streamSleepHook = nil
 }
 
 // SleepStreamBackoff waits for the stream reconnect backoff delay or until ctx is cancelled.
 func SleepStreamBackoff(ctx context.Context, attempt int) error {
-	if streamSleepHook != nil {
-		return streamSleepHook(ctx, attempt)
+	streamSleepHookMu.RLock()
+	hook := streamSleepHook
+	streamSleepHookMu.RUnlock()
+
+	if hook != nil {
+		return hook(ctx, attempt)
 	}
 
 	return Sleep(ctx, StreamBackoffDelay(attempt))

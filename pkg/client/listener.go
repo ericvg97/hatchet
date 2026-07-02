@@ -225,7 +225,6 @@ func (w *WorkflowRunsListener) retrySubscribeBackground(ctx context.Context) err
 		func(err error, attempt int) {
 			w.l.Error().Err(err).Msgf("could not resubscribe to the listener (background attempt %d)", attempt)
 		},
-		"could not resubscribe after %d consecutive no-progress errors: %w",
 	)
 }
 
@@ -258,6 +257,7 @@ func (w *WorkflowRunsListener) replayHandlers(ctx context.Context, client dispat
 type threadSafeHandlers struct {
 	// map of session ids to handlers
 	handlers map[string]WorkflowRunEventHandler
+	deleted  bool
 	mu       sync.RWMutex
 }
 
@@ -275,29 +275,29 @@ func (l *WorkflowRunsListener) AddWorkflowRun(
 		}
 	}
 
-	l.storeWorkflowRunHandler(workflowRunId, sessionId, handler)
+	rollback := l.storeWorkflowRunHandler(workflowRunId, sessionId, handler)
 
 	if err := l.retrySend(workflowRunId); err != nil {
-		l.removeWorkflowRunHandler(workflowRunId, sessionId)
-
 		if !l.isListening() {
 			if listenErr := l.ensureListening(l.lifecycleContext()); listenErr != nil {
+				rollback()
 				return listenErr
 			}
 
 			if retryErr := l.retrySend(workflowRunId); retryErr != nil {
+				rollback()
 				return retryErr
 			}
 
-			l.storeWorkflowRunHandler(workflowRunId, sessionId, handler)
 			return nil
 		}
 
+		rollback()
 		return err
 	}
 
 	if err := l.ensureListening(l.lifecycleContext()); err != nil {
-		l.removeWorkflowRunHandler(workflowRunId, sessionId)
+		rollback()
 		return err
 	}
 
@@ -307,17 +307,28 @@ func (l *WorkflowRunsListener) AddWorkflowRun(
 func (l *WorkflowRunsListener) storeWorkflowRunHandler(
 	workflowRunId, sessionId string,
 	handler WorkflowRunEventHandler,
-) {
-	handlers, _ := l.handlers.LoadOrStore(workflowRunId, &threadSafeHandlers{
-		handlers: map[string]WorkflowRunEventHandler{},
-	})
+) func() {
+	for {
+		handlers, _ := l.handlers.LoadOrStore(workflowRunId, &threadSafeHandlers{
+			handlers: map[string]WorkflowRunEventHandler{},
+		})
 
-	h := handlers.(*threadSafeHandlers)
+		h := handlers.(*threadSafeHandlers)
 
-	h.mu.Lock()
-	h.handlers[sessionId] = handler
-	l.handlers.Store(workflowRunId, h)
-	h.mu.Unlock()
+		h.mu.Lock()
+		if h.deleted {
+			h.mu.Unlock()
+			l.handlers.CompareAndDelete(workflowRunId, h)
+			continue
+		}
+
+		h.handlers[sessionId] = handler
+		h.mu.Unlock()
+
+		return func() {
+			l.removeWorkflowRunHandlerFromBucket(workflowRunId, h, sessionId)
+		}
+	}
 }
 
 func (l *WorkflowRunsListener) removeWorkflowRunHandler(
@@ -330,13 +341,26 @@ func (l *WorkflowRunsListener) removeWorkflowRunHandler(
 
 	h := handlers.(*threadSafeHandlers)
 
+	l.removeWorkflowRunHandlerFromBucket(workflowRunId, h, sessionId)
+}
+
+func (l *WorkflowRunsListener) removeWorkflowRunHandlerFromBucket(
+	workflowRunId string,
+	h *threadSafeHandlers,
+	sessionId string,
+) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
+	if h.deleted {
+		return
+	}
 
 	delete(h.handlers, sessionId)
 
 	if len(h.handlers) == 0 {
-		l.handlers.Delete(workflowRunId)
+		h.deleted = true
+		l.handlers.CompareAndDelete(workflowRunId, h)
 	}
 }
 
@@ -420,7 +444,19 @@ func (l *WorkflowRunsListener) handleWorkflowRun(event *dispatchercontracts.Work
 
 	h.mu.RLock()
 
+	if h.deleted {
+		h.mu.RUnlock()
+		return nil
+	}
+
+	handlerSnapshots := make([]WorkflowRunEventHandler, 0, len(h.handlers))
 	for _, handler := range h.handlers {
+		handlerSnapshots = append(handlerSnapshots, handler)
+	}
+
+	h.mu.RUnlock()
+
+	for _, handler := range handlerSnapshots {
 		handlerCp := handler
 
 		eg.Go(func() error {
@@ -432,8 +468,6 @@ func (l *WorkflowRunsListener) handleWorkflowRun(event *dispatchercontracts.Work
 			return handlerCp(workflowRunEvent)
 		})
 	}
-
-	h.mu.RUnlock()
 
 	err := eg.Wait()
 
@@ -447,7 +481,7 @@ func (l *WorkflowRunsListener) hasHandlers() bool {
 		h := value.(*threadSafeHandlers)
 
 		h.mu.RLock()
-		hasHandlers = len(h.handlers) > 0
+		hasHandlers = !h.deleted && len(h.handlers) > 0
 		h.mu.RUnlock()
 
 		return !hasHandlers
@@ -594,7 +628,6 @@ func (r *subscribeClientImpl) StreamByAdditionalMetadata(ctx context.Context, ke
 		func(err error, attempt int) {
 			r.l.Error().Err(err).Msgf("could not resubscribe to metadata stream (background attempt %d)", attempt)
 		},
-		"could not resubscribe to metadata stream after %d consecutive no-progress errors: %w",
 	); err != nil {
 		return err
 	}

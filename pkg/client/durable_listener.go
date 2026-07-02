@@ -121,7 +121,6 @@ func (w *DurableEventsListener) retryListenBackground(ctx context.Context) error
 		func(err error, attempt int) {
 			w.l.Error().Ctx(ctx).Err(err).Msgf("could not resubscribe to the durable event listener (background attempt %d)", attempt)
 		},
-		"could not resubscribe after %d consecutive no-progress errors: %w",
 	)
 }
 
@@ -185,8 +184,15 @@ func (w *DurableEventsListener) ensureListening(ctx context.Context) error {
 }
 
 type threadSafeDurableEventHandlers struct {
-	handlers []DurableEventHandler
+	handlers map[uint64]DurableEventHandler
+	nextID   uint64
+	deleted  bool
 	mu       sync.RWMutex
+}
+
+type durableEventHandlerSnapshot struct {
+	handler DurableEventHandler
+	id      uint64
 }
 
 func (l *DurableEventsListener) AddSignal(
@@ -212,21 +218,21 @@ func (l *DurableEventsListener) AddSignal(
 	rollback := l.storeDurableEventHandler(t, handler)
 
 	if err := l.retrySend(t); err != nil {
-		rollback()
-
 		if !l.isListening() {
 			if listenErr := l.ensureListening(l.lifecycleContext()); listenErr != nil {
+				rollback()
 				return listenErr
 			}
 
 			if retryErr := l.retrySend(t); retryErr != nil {
+				rollback()
 				return retryErr
 			}
 
-			l.storeDurableEventHandler(t, handler)
 			return nil
 		}
 
+		rollback()
 		return err
 	}
 
@@ -239,31 +245,50 @@ func (l *DurableEventsListener) AddSignal(
 }
 
 func (l *DurableEventsListener) storeDurableEventHandler(t listenTuple, handler DurableEventHandler) func() {
-	handlers, _ := l.handlers.LoadOrStore(t, &threadSafeDurableEventHandlers{
-		handlers: []DurableEventHandler{},
-	})
+	for {
+		handlers, _ := l.handlers.LoadOrStore(t, &threadSafeDurableEventHandlers{
+			handlers: map[uint64]DurableEventHandler{},
+		})
 
-	h := handlers.(*threadSafeDurableEventHandlers)
+		h := handlers.(*threadSafeDurableEventHandlers)
 
-	h.mu.Lock()
-	index := len(h.handlers)
-	h.handlers = append(h.handlers, handler)
-	l.handlers.Store(t, h)
-	h.mu.Unlock()
-
-	return func() {
 		h.mu.Lock()
-		defer h.mu.Unlock()
-
-		if index >= len(h.handlers) {
-			return
+		if h.deleted {
+			h.mu.Unlock()
+			l.handlers.CompareAndDelete(t, h)
+			continue
 		}
 
-		h.handlers = append(h.handlers[:index], h.handlers[index+1:]...)
+		id := h.nextID
+		h.nextID++
+		h.handlers[id] = handler
+		h.mu.Unlock()
 
-		if len(h.handlers) == 0 {
-			l.handlers.Delete(t)
+		return func() {
+			l.removeDurableEventHandlersFromBucket(t, h, id)
 		}
+	}
+}
+
+func (l *DurableEventsListener) removeDurableEventHandlersFromBucket(
+	t listenTuple,
+	h *threadSafeDurableEventHandlers,
+	ids ...uint64,
+) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.deleted {
+		return
+	}
+
+	for _, id := range ids {
+		delete(h.handlers, id)
+	}
+
+	if len(h.handlers) == 0 {
+		h.deleted = true
+		l.handlers.CompareAndDelete(t, h)
 	}
 }
 
@@ -347,20 +372,36 @@ func (l *DurableEventsListener) handleEvent(e *contracts.DurableEvent) error {
 
 	h.mu.RLock()
 
-	for _, handler := range h.handlers {
-		handlerCp := handler
+	if h.deleted {
+		h.mu.RUnlock()
+		return nil
+	}
+
+	handlerSnapshots := make([]durableEventHandlerSnapshot, 0, len(h.handlers))
+	for id, handler := range h.handlers {
+		handlerSnapshots = append(handlerSnapshots, durableEventHandlerSnapshot{
+			id:      id,
+			handler: handler,
+		})
+	}
+
+	h.mu.RUnlock()
+
+	handledIDs := make([]uint64, 0, len(handlerSnapshots))
+
+	for _, handlerSnapshot := range handlerSnapshots {
+		handlerCp := handlerSnapshot.handler
+		handledIDs = append(handledIDs, handlerSnapshot.id)
 
 		eg.Go(func() error {
 			return handlerCp(e)
 		})
 	}
 
-	h.mu.RUnlock()
-
 	err := eg.Wait()
 
 	if err == nil {
-		l.handlers.Delete(t)
+		l.removeDurableEventHandlersFromBucket(t, h, handledIDs...)
 	}
 
 	return err
@@ -373,7 +414,7 @@ func (l *DurableEventsListener) hasHandlers() bool {
 		h := value.(*threadSafeDurableEventHandlers)
 
 		h.mu.RLock()
-		hasHandlers = len(h.handlers) > 0
+		hasHandlers = !h.deleted && len(h.handlers) > 0
 		h.mu.RUnlock()
 
 		return !hasHandlers

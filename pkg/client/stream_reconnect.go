@@ -62,7 +62,6 @@ func listenReconnectingStream[C any, E any](
 	}()
 
 	verb := cfg.labels.reconnectVerb
-	noProgressFormat := fmt.Sprintf("could not %s after %%d consecutive no-progress errors: %%w", verb)
 
 	for {
 		event, err := cfg.recv(client)
@@ -73,11 +72,11 @@ func listenReconnectingStream[C any, E any](
 				eofPolicy = streamEOFRetries
 			}
 
-			decision := classifyStreamRecvError(ctx, err, eofPolicy)
+			decision, stopErr := classifyStreamListenRecvError(ctx, err, eofPolicy)
 
 			switch decision {
 			case retry.StreamDecisionStop:
-				return nil
+				return stopErr
 			case retry.StreamDecisionNoProgress:
 				consecutiveNoProgress++
 				if consecutiveNoProgress >= maxConsecutiveStreamNoProgress {
@@ -108,7 +107,6 @@ func listenReconnectingStream[C any, E any](
 				func(err error, attempt int) {
 					cfg.l.Error().Err(err).Msgf("could not %s to the %s (background attempt %d)", verb, cfg.labels.streamName, attempt)
 				},
-				noProgressFormat,
 			)
 
 			if retryErr != nil {
@@ -117,8 +115,16 @@ func listenReconnectingStream[C any, E any](
 				}
 
 				retryDecision := retry.ClassifyStreamError(ctx, retryErr)
-				if streamDecisionStopsReconnect(retryDecision) {
+				if retryDecision == retry.StreamDecisionStop {
+					if isCleanStreamStop(ctx, retryErr) {
+						return nil
+					}
+
 					return fmt.Errorf("failed to %s: %w", verb, retryErr)
+				}
+
+				if retryDecision == retry.StreamDecisionNoProgress {
+					consecutiveNoProgress++
 				}
 
 				cfg.l.Error().Err(retryErr).Msgf("failed to %s (consecutive no-progress: %d/%d)", verb, consecutiveNoProgress, maxConsecutiveStreamNoProgress)
@@ -165,8 +171,25 @@ func classifyStreamRecvError(ctx context.Context, err error, eofPolicy streamEOF
 	return retry.ClassifyStreamError(ctx, err)
 }
 
-func streamDecisionStopsReconnect(decision retry.StreamDecision) bool {
-	return decision == retry.StreamDecisionStop || decision == retry.StreamDecisionNoProgress
+func classifyStreamListenRecvError(ctx context.Context, err error, eofPolicy streamEOFPolicy) (retry.StreamDecision, error) {
+	decision := classifyStreamRecvError(ctx, err, eofPolicy)
+	if decision != retry.StreamDecisionStop {
+		return decision, nil
+	}
+
+	if isCleanStreamStop(ctx, err) {
+		return retry.StreamDecisionStop, nil
+	}
+
+	if errors.Is(err, io.EOF) && eofPolicy == streamEOFStops {
+		return retry.StreamDecisionStop, nil
+	}
+
+	return retry.StreamDecisionStop, err
+}
+
+func isCleanStreamStop(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || errors.Is(err, errListenerClosed) || errors.Is(err, context.Canceled)
 }
 
 func sendListenerError(ctx context.Context, errCh chan<- error, err error) {
@@ -314,14 +337,13 @@ func (s *reconnectingStream[C]) retryConnectSync(
 func (s *reconnectingStream[C]) retryConnectBackground(
 	ctx context.Context,
 	logAttempt func(error, int),
-	noProgressFormat string,
 ) error {
 	if s.isClosed() {
 		return errListenerClosed
 	}
 
 	_, err, _ := s.reconnectBackgroundGroup.Do("reconnect", func() (interface{}, error) {
-		return nil, retryStreamConnectBackground(ctx, s.isClosed, s.connectAndReplay, logAttempt, noProgressFormat)
+		return nil, retryStreamConnectBackground(ctx, s.isClosed, s.connectAndReplay, logAttempt)
 	})
 	return err
 }
@@ -431,10 +453,8 @@ func retryStreamConnectBackground(
 	isClosed func() bool,
 	connect func(context.Context) error,
 	logAttempt func(error, int),
-	noProgressFormat string,
 ) error {
 	attempt := 0
-	consecutiveNoProgress := 0
 
 	for {
 		if attempt > 0 {
@@ -460,15 +480,9 @@ func retryStreamConnectBackground(
 		case retry.StreamDecisionStop:
 			return err
 		case retry.StreamDecisionNoProgress:
-			consecutiveNoProgress++
-			if consecutiveNoProgress >= maxConsecutiveStreamNoProgress {
-				return fmt.Errorf(noProgressFormat, consecutiveNoProgress, err)
-			}
-
 			return err
 		}
 
-		consecutiveNoProgress = 0
 		logAttempt(err, attempt+1)
 		attempt++
 	}
